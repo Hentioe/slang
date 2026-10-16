@@ -13,6 +13,26 @@ const default_slang_version = "0.0.0";
 /// mode so it stays consistent with the core libraries they link against.
 const build_time_optimize: std.builtin.OptimizeMode = .ReleaseFast;
 
+/// Target used for the build-time host tools (the generators and the bootstrap
+/// compiler) and the libraries they link.
+///
+/// These tools are compiled and then *executed* during the build, so they must
+/// run on the build host. By default they use the consumer target's libc. When
+/// `host_musl_static` is enabled, on Linux they are instead built against musl
+/// so that, combined with the static linkage from `hostLinkage`, they become
+/// fully static executables that run even where the consumer target's dynamic
+/// loader is unavailable (for example sandboxed/Nix builds, where spawning the
+/// tool otherwise fails with an opaque `FileNotFound`). musl is used because it
+/// ships with Zig and needs no external sysroot; glibc cannot be used because
+/// NixOS does not provide its static archives (`libc.a`).
+fn hostTarget(b: *std.Build, target: std.Build.ResolvedTarget, musl_static: bool) std.Build.ResolvedTarget {
+    if (!musl_static) return target;
+    if (target.result.os.tag != .linux) return target;
+    var query = target.query;
+    query.abi = .musl;
+    return b.resolveTargetQuery(query);
+}
+
 /// Roots of the third-party source trees that upstream keeps as git submodules
 /// under `external/`.
 const External = struct {
@@ -40,6 +60,17 @@ pub fn build(b: *std.Build) void {
     const external = resolveExternal(b) orelse return;
     const lua_include = luaIncludeDir(b, external);
 
+    // Whether the build-time host tools are linked statically against musl
+    // instead of using the consumer target's libc. See `hostTarget`.
+    const host_musl_static = b.option(
+        bool,
+        "host_musl_static",
+        "Build the build-time host tools (generators and bootstrap) as static musl executables instead of using the default libc",
+    ) orelse false;
+
+    // Target for the build-time host tools and the libraries they link.
+    const host_target = hostTarget(b, target, host_musl_static);
+
     // miniz.h includes a generated "miniz_export.h" (normally produced by
     // CMake's generate_export_header). For a static build the export macro
     // expands to nothing, so provide a minimal replacement.
@@ -52,6 +83,7 @@ pub fn build(b: *std.Build) void {
     );
 
     const miniz = addMiniz(b, target, optimize, external.miniz, miniz_export.getDirectory());
+    const miniz_host = addMiniz(b, host_target, build_time_optimize, external.miniz, miniz_export.getDirectory());
 
     // cmark's config.h is generated from a template that only toggles
     // CMARK_THREADING (off by default upstream; Slang does not enable it).
@@ -66,6 +98,8 @@ pub fn build(b: *std.Build) void {
 
     const lz4 = addLz4(b, target, optimize, external.lz4);
     const cmark = addCmark(b, target, optimize, external.cmark, cmark_config.getDirectory());
+    const lz4_host = addLz4(b, host_target, build_time_optimize, external.lz4);
+    const cmark_host = addCmark(b, host_target, build_time_optimize, external.cmark, cmark_config.getDirectory());
 
     // glslang + SPIRV-Tools and the `slang-glslang` module they back. The grammar
     // tables and glslang's `build_info.h` are the pre-generated copies checked
@@ -87,24 +121,30 @@ pub fn build(b: *std.Build) void {
     const core = addCore(b, target, optimize, external, miniz, lz4, miniz_export.getDirectory());
     const compiler_core = addCompilerCore(b, target, optimize, external, core, version_header.getDirectory());
 
+    // Host variants, used only by the build-time tools/generators and the
+    // bootstrap compiler. They are built for `host_target` so they can be
+    // executed during the build.
+    const core_host = addCore(b, host_target, build_time_optimize, external, miniz_host, lz4_host, miniz_export.getDirectory());
+    const compiler_core_host = addCompilerCore(b, host_target, build_time_optimize, external, core_host, version_header.getDirectory());
+
     // Host tools compiled from the repository itself (the "generators").
-    const embed_exe = addHostExecutable(b, target, optimize, external, lua_include, "slang-embed", &.{
+    const embed_exe = addHostExecutable(b, host_target, optimize, external, lua_include, "slang-embed", &.{
         "tools/slang-embed/slang-embed.cpp",
-    }, &.{core}, &.{});
-    const generate_exe = addHostExecutable(b, target, optimize, external, lua_include, "slang-generate", &.{
+    }, &.{core_host}, &.{});
+    const generate_exe = addHostExecutable(b, host_target, optimize, external, lua_include, "slang-generate", &.{
         "tools/slang-generate/main.cpp",
-    }, &.{core}, &.{});
-    const capability_exe = addHostExecutable(b, target, optimize, external, lua_include, "slang-capability-generator", &.{
+    }, &.{core_host}, &.{});
+    const capability_exe = addHostExecutable(b, host_target, optimize, external, lua_include, "slang-capability-generator", &.{
         "tools/slang-capability-generator/capability-generator-main.cpp",
-    }, &.{compiler_core}, &.{});
-    const lookup_exe = addHostExecutable(b, target, optimize, external, lua_include, "slang-lookup-generator", &.{
+    }, &.{compiler_core_host}, &.{});
+    const lookup_exe = addHostExecutable(b, host_target, optimize, external, lua_include, "slang-lookup-generator", &.{
         "tools/slang-lookup-generator/lookup-generator-main.cpp",
-    }, &.{compiler_core}, &.{});
-    const spirv_embed_exe = addHostExecutable(b, target, optimize, external, lua_include, "slang-spirv-embed-generator", &.{
+    }, &.{compiler_core_host}, &.{});
+    const spirv_embed_exe = addHostExecutable(b, host_target, optimize, external, lua_include, "slang-spirv-embed-generator", &.{
         "tools/slang-spirv-embed-generator/spirv-embed-generator-main.cpp",
-    }, &.{compiler_core}, &.{});
-    const fiddle_exe = addHostExecutable(b, target, optimize, external, lua_include, "slang-fiddle",
-        globSources(b, "tools/slang-fiddle", target), &.{compiler_core}, &.{});
+    }, &.{compiler_core_host}, &.{});
+    const fiddle_exe = addHostExecutable(b, host_target, optimize, external, lua_include, "slang-fiddle",
+        globSources(b, "tools/slang-fiddle", host_target), &.{compiler_core_host}, &.{});
 
     const generated = runGenerators(b, embed_exe, generate_exe, capability_exe, lookup_exe, spirv_embed_exe, fiddle_exe, external.spirv_headers);
 
@@ -126,13 +166,13 @@ pub fn build(b: *std.Build) void {
     // Non-embedded compiler library, used only to build the bootstrap tool.
     const slang_base = addSlang(
         b,
-        target,
+        host_target,
         optimize,
         build_time_optimize,
         external,
-        core,
-        compiler_core,
-        cmark,
+        core_host,
+        compiler_core_host,
+        cmark_host,
         cmark_config.getDirectory(),
         generated,
         version_header.getDirectory(),
@@ -145,7 +185,7 @@ pub fn build(b: *std.Build) void {
     // runtime never has to compile the standard library.
     const slang_bootstrap = addSlangBootstrap(
         b,
-        target,
+        host_target,
         optimize,
         external,
         slang_base,
@@ -203,6 +243,19 @@ pub fn build(b: *std.Build) void {
         .header,
         "slang-tag-version.h",
     ).step);
+
+    // The build-time intermediate programs (generators and the bootstrap
+    // compiler) are only executed during the build, but are also surfaced in
+    // the install output so they can be inspected and run directly.
+    for ([_]*std.Build.Step.Compile{
+        embed_exe,
+        generate_exe,
+        capability_exe,
+        lookup_exe,
+        spirv_embed_exe,
+        fiddle_exe,
+        slang_bootstrap,
+    }) |exe| b.installArtifact(exe);
 
     check.dependOn(&miniz.step);
     check.dependOn(&lz4.step);
@@ -457,7 +510,7 @@ fn addSlang(
     mod.addIncludePath(generated.meta_dir);
 
     var flags: std.ArrayList([]const u8) = .empty;
-    flags.appendSlice(b.allocator, slangDefines(b, optimize)) catch @panic("out of memory");
+    flags.appendSlice(b.allocator, slangDefines(b, target, optimize)) catch @panic("out of memory");
     // Record-replay is excluded from this build, matching SLANG_ENABLE_RECORD_REPLAY=OFF;
     // its C API is compiled as exported disabled stubs.
     flags.append(b.allocator, "-DSLANG_ENABLE_RECORD_REPLAY=0") catch @panic("out of memory");
@@ -546,14 +599,14 @@ fn addSlangBootstrap(
     mod.addIncludePath(generated.fiddle_dir);
     mod.addIncludePath(generated.meta_dir);
     var flags: std.ArrayList([]const u8) = .empty;
-    flags.appendSlice(b.allocator, slangDefines(b, optimize)) catch @panic("out of memory");
+    flags.appendSlice(b.allocator, slangDefines(b, target, optimize)) catch @panic("out of memory");
     flags.append(b.allocator, "-DSLANG_BOOTSTRAP=1") catch @panic("out of memory");
     mod.addCSourceFile(.{
         .file = b.path("source/slangc/main.cpp"),
         .flags = flags.items,
     });
     mod.linkLibrary(slang_lib);
-    return b.addExecutable(.{ .name = "slang-bootstrap", .root_module = mod });
+    return b.addExecutable(.{ .name = "slang-bootstrap", .root_module = mod, .linkage = hostLinkage(target) });
 }
 
 fn addHostExecutable(
@@ -581,11 +634,19 @@ fn addHostExecutable(
     mod.addIncludePath(external.spirv_headers.path(b, "include"));
     mod.addIncludePath(lua_include);
     var flags: std.ArrayList([]const u8) = .empty;
-    flags.appendSlice(b.allocator, slangDefines(b, optimize)) catch @panic("out of memory");
+    flags.appendSlice(b.allocator, slangDefines(b, target, optimize)) catch @panic("out of memory");
     flags.appendSlice(b.allocator, extra_flags) catch @panic("out of memory");
     mod.addCSourceFiles(.{ .files = sources, .flags = flags.items });
     for (libs) |lib| mod.linkLibrary(lib);
-    return b.addExecutable(.{ .name = name, .root_module = mod });
+    return b.addExecutable(.{ .name = name, .root_module = mod, .linkage = hostLinkage(target) });
+}
+
+/// Link mode for build-time host tools: static when they are built against musl
+/// (see `hostTarget`), so the resulting executables have no ELF interpreter and
+/// run regardless of the environment's dynamic linker. Otherwise keep the
+/// consumer target's default linkage.
+fn hostLinkage(target: std.Build.ResolvedTarget) ?std.builtin.LinkMode {
+    return if (target.result.abi == .musl) .static else null;
 }
 
 /// Lists the names of files directly inside `dir` (non-recursive) matching any
@@ -635,9 +696,14 @@ const slang_defines_base = [_][]const u8{
 
 /// `_DEBUG` selects the aborting assertion path over `__builtin_assume`,
 /// matching upstream's per-configuration define.
-fn slangDefines(b: *std.Build, optimize: std.builtin.OptimizeMode) []const []const u8 {
+fn slangDefines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) []const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     list.appendSlice(b.allocator, &slang_defines_base) catch @panic("out of memory");
+    // musl gates the `fpos64_t` / `fgetpos64` aliases (used by
+    // `FileStream::getPosition` on non-Windows, non-Apple platforms) behind
+    // `_LARGEFILE64_SOURCE`; glibc exposes them unconditionally.
+    if (target.result.abi == .musl)
+        list.append(b.allocator, "-D_LARGEFILE64_SOURCE") catch @panic("out of memory");
     if (optimize == .Debug) list.append(b.allocator, "-D_DEBUG") catch @panic("out of memory");
     return list.toOwnedSlice(b.allocator) catch @panic("out of memory");
 }
@@ -665,7 +731,7 @@ fn addCore(
     mod.addIncludePath(external.lz4.path(b, "lib"));
     mod.addCSourceFiles(.{
         .files = globSources(b, "source/core", target),
-        .flags = slangDefines(b, optimize),
+        .flags = slangDefines(b, target, optimize),
     });
     mod.linkLibrary(miniz);
     mod.linkLibrary(lz4);
@@ -699,11 +765,11 @@ fn addCompilerCore(
         // with precompiled headers upstream, so it is applied to this file only.
         if (std.mem.endsWith(u8, file, "slang-dxc-compiler.cpp")) {
             var flags: std.ArrayList([]const u8) = .empty;
-            flags.appendSlice(b.allocator, slangDefines(b, optimize)) catch @panic("out of memory");
+            flags.appendSlice(b.allocator, slangDefines(b, target, optimize)) catch @panic("out of memory");
             flags.append(b.allocator, "-fms-extensions") catch @panic("out of memory");
             mod.addCSourceFile(.{ .file = b.path(file), .flags = flags.items });
         } else {
-            mod.addCSourceFile(.{ .file = b.path(file), .flags = slangDefines(b, optimize) });
+            mod.addCSourceFile(.{ .file = b.path(file), .flags = slangDefines(b, target, optimize) });
         }
     }
     mod.linkLibrary(core);

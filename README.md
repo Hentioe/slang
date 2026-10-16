@@ -54,6 +54,9 @@ pub fn build(b: *std.Build) void {
     const slang_dep = b.dependency("slang", .{
         .target = target,
         .optimize = optimize,
+        // 可选：构建期中间程序（生成器、slang-bootstrap）是否用 musl 静态编译。
+        // 默认 false（跟随目标 libc）；沙箱环境缺动态加载器时再打开。
+        // .host_musl_static = true,
     });
 
     const exe_mod = b.createModule(.{
@@ -145,3 +148,7 @@ note[E99996]: failed to load dynamic library 'slang-glslang-0.0.0'
   出厂产物（`libslang-compiler.a`、`libslang-glslang.a`）及它们链接的
   `core`、`compiler-core`、`cmark-gfm`、`miniz`、`lz4`、`glslang`、
   `SPIRV-Tools` 仍然跟随集成方的 `optimize`。
+- **构建期中间程序默认使用目标 libc**。若在缺少目标动态加载器的沙箱环境（如
+  NixOS）中构建、导致这些工具无法执行（`FileNotFound`/ENOENT），可在依赖参数里传
+  `.host_musl_static = true`，让它们改为 musl 静态链接；直接构建本仓库时等价于
+  `zig build -Dhost_musl_static=true`（默认 `false`，即默认 libc）。
