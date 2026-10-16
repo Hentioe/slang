@@ -1,157 +1,135 @@
-<!--
-SPDX-FileCopyrightText: The Khronos Group, Inc.
-SPDX-License-Identifier: CC-BY-4.0
--->
+# Slang（Zig 构建 / Zig 依赖）
 
-# Slang
+本项目把 [shader-slang/slang](https://github.com/shader-slang/slang) 打包成一个可由其它
+Zig 项目直接依赖的构建过程与编译产物。
 
-![CI Status](https://github.com/shader-slang/slang/actions/workflows/ci.yml/badge.svg?branch=master)
-![CTS Status](https://github.com/shader-slang/slang/actions/workflows/nightly-slang-vkglcts-test.yml/badge.svg)
+**目的**：让其它 Zig 项目把 Slang 当作一个普通的 Zig 依赖引入（通过 `build.zig.zon`），
+**无需把 Slang 源码复制进自己的工程**。本依赖负责：
 
-Slang is a shading language that makes it easier to build and maintain large shader codebases in a modular and extensible fashion, while also maintaining the highest possible performance on modern GPUs and graphics APIs.
-Slang is based on years of collaboration between researchers at NVIDIA, Carnegie Mellon University, Stanford, MIT, UCSD and the University of Washington.
+- 把 Slang 编译成静态库：`libslang-compiler.a`、`libslang-glslang.a`；
+- 提供 Slang 的公共头文件目录；
+- 提供一个用于装载进程内下游编译器的 C 函数。
 
-## Why Slang?
+集成方只需链接这两个静态库并 `addIncludePath`，然后自行编写 C++ shim 或
+`@cImport`/`extern` 接入使用。**本依赖不提供任何 Zig 层 API。**
 
-The Slang shading language is designed to enable real-time graphics developers to work with large-scale, high-performance shader code.
+> [!WARNING]
+> **注意**：本项目是为了给 [Hentioe/jve](https://github.com/Hentioe/jve) 做支持而诞生，除此之外的其它目的都不会作为首要目标。
 
-### Write Shaders Once, Run Anywhere
+## 外部集成
 
-The Slang compiler can generate code for a wide variety of targets: D3D12, Vulkan, Metal, D3D11, CUDA, and even generate code to run on a CPU. For textual targets, such as Metal Shading Language (MSL) and CUDA, Slang produces readable code that preserves original identifier names, as well as the type and call structure, making it easier to debug.
+本项目**不提供任何 Zig 层的 API**。它只提供构建产物（`slang-compiler`、`slang-glslang`
+两个静态库）与公共头文件目录，以及一个用于装载进程内下游编译器的 C 函数。集成方拿到后
+自行编写 C++ shim 或 `@cImport`/`extern` 去接入。
 
-### Access the Latest GPU Features
+下面是完整的集成步骤。把本项目作为普通 Zig 依赖引入即可，无需把 Slang 源码复制进项目。
 
-Slang code is highly portable, but can still leverage unique platform capabilities, including the latest features in Direct3D and Vulkan. For example, developers can make full use of [pointers](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/03-convenience-features.html#pointers-limited) when generating SPIR-V.
-Slang's [capability system](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/05-capabilities.html) helps applications manage feature set differences across target platforms by ensuring code only uses available features during the type-checking step, before generating final code. Additionally, Slang provides [flexible interop](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/a1-04-interop.html) features to enable directly embedding target code or SPIR-V into generated shaders.
+### 1. 在 `build.zig.zon` 中声明依赖
 
-### Leverage Neural Graphics with Automatic Differentiation
+```zig
+.{
+    .name = .my_project,
+    .version = "0.0.0",
+    .fingerprint = 0x0, // 运行一次后按提示填写
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        // 本地路径（相对路径，不能用绝对路径）
+        .slang = .{ .path = "../slang" },
+        // 或使用 git/URL 依赖
+        // .slang = .{ .url = "https://.../slang/archive/<rev>.tar.gz", .hash = "..." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
+```
 
-Slang can [automatically generate both forward and backward derivative propagation code](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/07-autodiff.html) for complex functions that involve arbitrary control flow and dynamic dispatch. This allows existing rendering codebases to easily become differentiable, or for Slang to serve as the kernel language in a PyTorch-driven machine learning framework via [`slangtorch`](https://docs.shader-slang.org/en/latest/external/slang/docs/deprecated/a1-02-slangpy.html).
+### 2. 在 `build.zig` 中接入
 
-### Scalable Software Development with Modules
+```zig
+const std = @import("std");
 
-Slang provides a [module system](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/04-modules-and-access-control.html) that enables logical organization of code for separate compilation. Slang modules can be independently compiled offline to a custom IR (with optional obfuscation) and then linked at runtime to generate code in formats such as DXIL or SPIR-V.
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
 
-### Code Specialization that Works with Modules
+    const slang_dep = b.dependency("slang", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
-Slang supports [generics and interfaces](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/06-interfaces-generics.html) (a.k.a. type traits/protocols), allowing for clear expression of shader specialization without the need for preprocessor techniques or string-pasting. Unlike C++ templates, Slang's generics are pre-checked and don't produce cascading error messages that are difficult to diagnose. The same generic shader can be specialized for a variety of different types to produce specialized code ahead of time, or on the fly, entirely under application control.
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        // Slang 底层是 C++ 静态库，必须链接 libc++。
+        .link_libc = true,
+        .link_libcpp = true,
+    });
 
-### Easy On-ramp for HLSL and GLSL Codebases
+    // 关键：include 路径不会随 addImport 传递，必须显式添加。
+    exe_mod.addIncludePath(slang_dep.path("include"));
+    // 链接 Slang 静态库（产物名固定为 slang-compiler）。
+    exe_mod.linkLibrary(slang_dep.artifact("slang-compiler"));
+    // 链接进程内的 downstream 编译器（glslang + SPIRV-Tools；spirv-opt 等）。
+    exe_mod.linkLibrary(slang_dep.artifact("slang-glslang"));
 
-Slang's syntax is similar to HLSL, and most existing HLSL code can be compiled with the Slang compiler out-of-the-box, or with just minor modifications. This allows existing shader codebases to immediately benefit from Slang without requiring a complete rewrite or port.
+    const exe = b.addExecutable(.{ .name = "my_project", .root_module = exe_mod });
+    b.installArtifact(exe);
+}
+```
 
-Slang provides a compatibility module that enables the use of most GLSL intrinsic functions and GLSL's parameter binding syntax.
+### 3. 自行接入 Slang
 
-### Comprehensive Tooling Support
+`include/slang.h` 是**纯 C++ 头**（无条件使用 `namespace`/`class`/`enum class`），
+`@cImport` 无法直接翻译。集成方有两条路：
 
-Slang comes with full support of IntelliSense editing features in Visual Studio Code and Visual Studio through the Language Server Protocol.
-Full debugging capabilities are also available through RenderDoc and SPIR-V based tools.
+- **自写 C++ shim**：在自己的构建里用 `addCSourceFile` 编译一个 `.cpp`，其中
+  `#include <slang.h>`（可配合 `include/slang-com-ptr.h` 的 `Slang::ComPtr`），
+  对外暴露 `extern "C"` 接口，再由 Zig 调用。编译该文件需
+  `-std=c++20 -DSLANG_STATIC=1`，并确保模块 `link_libcpp = true`。
+- **扁平 C API**：库导出的 `sp*` / `slang_*` 系列本身就是 `extern "C"` 符号，
+  集成方可以自行手写一个最小 C 头并 `@cImport`，或直接 `extern "C" fn` 声明。
 
-## Getting Started
+### 4. 初始化：装载进程内下游编译器（必需）
 
-The fastest way to get started using Slang in your own development is to use a pre-built binary package, available through GitHub [releases](https://github.com/shader-slang/slang/releases).
-Slang binaries are also included in the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) since version 1.3.296.0.
+Slang 的下游编译器（`spirv-opt` 等）是**运行时经 `ISlangSharedLibraryLoader` 按需加载**的，
+默认走 `DefaultSharedLibraryLoader`（即 `dlopen`）。所以**只把静态库链接进来不会生效**，
+必须在取得全局会话之后、创建 session / 编译之前，调用一次本库导出的装载函数：
 
-There are packages built for x86_64 and aarch64 Windows, Linux and macOS.
-Each binary release includes the command-line `slangc` compiler, a shared library for the compiler, and the `slang.h` header.
+```cpp
+// 本库导出（见 source/slang-glslang/slang-glslang-embedded.h）；参数是 slang::IGlobalSession*。
+extern "C" void slang_glslang_install_embedded(void* globalSession);
 
-See the user-guide for info on using the `slangc` command-line tool: [Slang Command Line Usage](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/08-compiling.html#command-line-compilation-with-slangc).
+// 正确的调用位置与顺序：
+slang::IGlobalSession* global = nullptr;
+slang_createGlobalSession(SLANG_API_VERSION, &global);
 
-If you want to try out the Slang language without installing anything, a fast and simple way is to use the [Slang Playground](https://shader-slang.com/slang-playground). The playground allows you to compile Slang code to a variety of targets, and even run some simple shaders directly within the browser. The playground loads Slang compiler to your browser and runs all compilation locally. No data will be sent to any servers.
+slang_glslang_install_embedded(global); // 必须，且要在这里（建 session / 编译之前）
 
-If you would like to build Slang from source, please consult the [build instructions](docs/building.md).
+// 之后再 slang::IGlobalSession::createSession(...) / 编译。
+```
 
-## Documentation
+它内部执行 `global->setSharedLibraryLoader(<进程内 loader>)`，使下游能力从进程内实现获取，
+无需任何 `.so`、rpath 或 `LD_LIBRARY_PATH`。
 
-The Slang project provides a variety of different [documentation](docs/), but most users would be well served starting with the [User's Guide](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/).
+**漏掉此调用的症状**（因为 Slang 仍用默认加载器去 `dlopen`）：
 
-For developers writing Slang code, the [Slang Core Module Reference](https://docs.shader-slang.org/en/latest/external/core-module-reference/) provides detailed documentation on Slang's built-in types and functions.
+```plaintext
+error[E00100]: failed to load downstream compiler 'spirv-opt'
+note[E99996]: failed to load dynamic library 'slang-glslang-0.0.0'
+```
 
-Agent Skills-compatible assistants can use the [Slang user skills](https://github.com/shader-slang/slang-user-skills); Slang binary release packages include a tested snapshot under `share/slang/agent-skills` for optional, explicit installation.
+## 说明与注意事项
 
-We also provide a few [examples](examples/) of how to integrate Slang into a rendering application.
-
-These examples use a graphics layer that we include with Slang called "GFX" which is an abstraction library of various graphics APIs (D3D11, D2D12, OpenGL, Vulkan, CUDA, and the CPU) to support cross-platform applications using GPU graphics and compute capabilities.
-GFX is being deprecated in favor of [slang-rhi](https://github.com/shader-slang/slang-rhi).
-
-Additionally, we recommend checking out [Vulkan Mini Examples](https://github.com/nvpro-samples/vk_mini_samples/) for more examples of using Slang's language features available on Vulkan, such as pointers and the ray tracing intrinsics.
-
-## Contributing
-
-If you'd like to contribute to the project, we are excited to have your input.
-The following guidelines should be observed by contributors:
-
-- Please follow the contributor [Code of Conduct](CODE_OF_CONDUCT.md).
-- Bugs reports and feature requests should go through the GitHub issue tracker
-- Changes should ideally come in as small pull requests on top of `master`, coming from your own personal fork of the project
-- Large features that will involve multiple contributors or a long development time should be discussed in issues, and broken down into smaller pieces that can be implemented and checked in in stages
-
-[Contribution guide](CONTRIBUTING.md) describes the workflow for contributors at more detail.
-
-## Limitations and Support
-
-### Platform support
-
-The Slang compiler and libraries can be built on the following platforms:
-
-|  Windows  |   Linux   |   MacOS   | WebAssembly  |
-| :-------: | :-------: | :-------: | :----------: |
-| supported | supported | supported | experimental |
-
-Both `x86_64` and `aarch64` architectures are supported on Windows, Linux and MacOS platforms.
-
-### Target support
-
-Slang can compile shader code to the following targets:
-
-|   Target    |                                                        Status                                                         |                          Output Formats                          |
-| :---------: | :-------------------------------------------------------------------------------------------------------------------: | :--------------------------------------------------------------: |
-| Direct3D 11 |    [supported](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/09-targets.html#direct3d-11)    |                               HLSL                               |
-| Direct3D 12 |    [supported](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/09-targets.html#direct3d-12)    |                               HLSL                               |
-|   Vulkan    |      [supported](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/09-targets.html#vulkan)       |                           SPIRV, GLSL                            |
-|    Metal    |    [experimental\*](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/09-targets.html#metal)     |                      Metal Shading Language                      |
-|   WebGPU    |                                                   experimental\*\*                                                    |                               WGSL                               |
-|    CUDA     |  [supported](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/09-targets.html#cuda-and-optix)   |                        C++ (compute only)                        |
-|    Optix    | [experimental](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/09-targets.html#cuda-and-optix) |                            C++ (WIP)                             |
-|     CPU     |  [experimental](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/09-targets.html#cpu-compute)   | C++ (kernel), C++ (host), standalone executable, dynamic library |
-
-> \*Slang currently supports generating vertex, fragment, compute, task and mesh
-> shaders for Metal.
-
-> \*\*WGSL support is still work in-progress.
-
-For greater detail, see the [Supported Compilation Targets](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/09-targets.html) section of the
-[User Guide](https://docs.shader-slang.org/en/latest/external/slang/docs/user-guide/)
-
-The Slang project has been used for production applications and large shader
-codebases, but it is still under active development. Support is currently
-focused on the platforms (Windows, Linux) and target APIs (Direct3D 12, Vulkan)
-where Slang is used most heavily. Users who are looking for support on other
-platforms or APIs should coordinate with the development team via the issue
-tracker to make sure that their use cases can be supported.
-
-## License
-
-The Slang code itself is under the Apache 2.0 with LLVM Exception license (see [LICENSE](LICENSE)).
-
-Builds of the core Slang tools depend on the following projects, either automatically or optionally, which may have their own licenses:
-
-- [`ankerl::unordered_dense::{map, set}`](https://github.com/martinus/unordered_dense) (MIT)
-- [`cmark-gfm`](https://github.com/swiftlang/swift-cmark) (BSD 2-Clause and MIT)
-- [`fast_float`](https://github.com/fastfloat/fast_float) (Apache 2.0 / MIT / Boost)
-- [`glslang`](https://github.com/KhronosGroup/glslang) (BSD)
-- [`lz4`](https://github.com/lz4/lz4) (BSD)
-- [`mimalloc`](https://github.com/microsoft/mimalloc) (MIT)
-- [`miniz`](https://github.com/richgel999/miniz) (MIT)
-- [`spirv-headers`](https://github.com/KhronosGroup/SPIRV-Headers) (Modified MIT)
-- [`spirv-tools`](https://github.com/KhronosGroup/SPIRV-Tools) (Apache 2.0)
-
-Slang releases may include [LLVM](https://github.com/llvm/llvm-project) under the license:
-
-- [`llvm`](https://llvm.org/docs/DeveloperPolicy.html#new-llvm-project-license-framework) (Apache 2.0 License with LLVM exceptions)
-
-Some of the tests and example programs that build with Slang use the following projects, which may have their own licenses:
-
-- [`glm`](https://github.com/g-truc/glm) (MIT)
-- `stb_image` and `stb_image_write` from the [`stb`](https://github.com/nothings/stb) collection of single-file libraries (Public Domain)
-- [`tinyobjloader`](https://github.com/tinyobjloader/tinyobjloader) (MIT)
+- **构建工具由集成方负责，而非本依赖**。本依赖自身通过 Zig 自带的 C++ 工具链
+  （`zig c++`，含 libc++）编译全部 C++ 源码，不要求集成方安装 CMake、g++ 或
+  clang。集成方只需：
+  - 一个满足 `minimum_zig_version` 的 Zig；
+  - 可访问到本仓库的 `external/` 子模块源码（路径或 git 依赖时需一并取得）。
+  - 若集成方目标平台（如交叉编译、其它 ABI）缺少合适的工具链，那属于集成方自
+    行解决的问题，本依赖不为此负责。
+- 集成包含**两处代码/构建改动**：`linkLibrary(slang-glslang)`（步骤 2），以及创建
+  全局会话后调用 `slang_glslang_install_embedded(global)`（步骤 4）。缺任一，下游
+  编译器都会走 `dlopen` 并报 `E00100`/`E99996`。
+- 首次构建需要从头编译整个 Slang 静态库，耗时与内存开销较大；这与上游 CMake
+  构建一致，且无 PCH 加速。构建期还会运行一次 `slang-bootstrap` 预编译 core
+  module（打印 `Compiling core module ...`，约数十秒），但这只发生在构建期。

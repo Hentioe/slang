@@ -1,0 +1,21 @@
+.{
+    .name = .slang,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.15.2",
+    .fingerprint = 0x681d367c56e59a99,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "include",
+        "source",
+        "prelude",
+        "tools/slang-fiddle",
+        "tools/slang-embed",
+        "tools/slang-generate",
+        "tools/slang-capability-generator",
+        "tools/slang-lookup-generator",
+        "tools/slang-spirv-embed-generator",
+        "external",
+        "cmake",
+    },
+}

@@ -168,3 +168,10 @@ replay-capture
 
 # Scaler autoscaler build output (built from source; see extras/scaler/README.md)
 /extras/scaler/scaler-linux
+
+# Porting
+/PORTING.md
+
+# Zig
+/.zig-cache/
+/zig-out/
