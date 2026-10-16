@@ -3,6 +3,60 @@
     .version = "0.0.0",
     .minimum_zig_version = "0.15.2",
     .fingerprint = 0x681d367c56e59a99,
+    // Third-party sources are git submodules upstream. A git submodule cannot
+    // travel inside a Zig package tarball, so every one of them is also declared
+    // here as a git dependency pinned to the same repository URL and commit as
+    // the submodule. `zig fetch` treats the commit as the pin, so the two stay
+    // in lockstep and the URL does not need rewriting when the submodule moves.
+    // `lazy = true` keeps local development offline: a checkout that already has
+    // the submodule populated never downloads these. See PORTING.md.
+    .dependencies = .{
+        .unordered_dense = .{
+            .url = "git+https://github.com/martinus/unordered_dense#73f3cbb237e84d483afafc743f1f14ec53e12314",
+            .hash = "N-V-__8AAFdJPQAl6CxKMHf2wXdxBdN-vipngsh6Tg1JLY1I",
+            .lazy = true,
+        },
+        .fast_float = .{
+            .url = "git+https://github.com/fastfloat/fast_float#e0b53eaf63c6d00e0725788ef1dbb759aa321d79",
+            .hash = "N-V-__8AABDbCAAZOSLwPsdRuIfOsTJRKEV6tQLeR-wsqe7o",
+            .lazy = true,
+        },
+        .spirv_headers = .{
+            .url = "git+https://github.com/KhronosGroup/SPIRV-Headers#cb42dec3830d3ac67fa449ecdc0c0f73d5e74498",
+            .hash = "N-V-__8AAHjlPwChqOB01fulYNDe8oV7RcO-heJYxpd0z0_E",
+            .lazy = true,
+        },
+        .cmark = .{
+            .url = "git+https://github.com/swiftlang/swift-cmark#924936d0427cb25a61169739a7660230bffa6ea6",
+            .hash = "N-V-__8AANI7GADWD8lBBrRPWDH6xoyiUZ5_Fx9x_3yVoAXy",
+            .lazy = true,
+        },
+        .miniz = .{
+            .url = "git+https://github.com/richgel999/miniz#6ef6c68f4fcbb8287aa8edf9c6670804932f41c6",
+            .hash = "N-V-__8AAKFVFgB7o-RH9Wi2JmIurGztJwj1ZJnXqj7pbqMW",
+            .lazy = true,
+        },
+        .lz4 = .{
+            .url = "git+https://github.com/lz4/lz4#7f71be01f2c6f6b2c3cddb67eef8c38eab12ffd4",
+            .hash = "N-V-__8AAP-yGQAy2Cxpgf_sINTVgcT8XA_4C0Zeh9cJR4_G",
+            .lazy = true,
+        },
+        .lua = .{
+            .url = "git+https://github.com/lua/lua#3fe7be956f23385aa1950dc31e2f25127ccfc0ea",
+            .hash = "N-V-__8AALiZGQDddaUgdV3uhZrNpEB06U-GnqDxD3KCIsMG",
+            .lazy = true,
+        },
+        .glslang = .{
+            .url = "git+https://github.com/KhronosGroup/glslang#d1f52c8993a501bd52d4fbd044bfeb9ecdceb9f4",
+            .hash = "N-V-__8AAMdrngKlYKjXbAGa1iJd7vYImgKRz4cWFFEh9sKx",
+            .lazy = true,
+        },
+        .spirv_tools = .{
+            .url = "git+https://github.com/KhronosGroup/SPIRV-Tools#7a88476ddf5f541ba553cbe009227d7510d258eb",
+            .hash = "N-V-__8AACnqlwFCGjkuVKKh0Mtky-bMQSwcP6r7VF9YLl9W",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
@@ -15,6 +69,7 @@
         "tools/slang-capability-generator",
         "tools/slang-lookup-generator",
         "tools/slang-spirv-embed-generator",
+        "tools/platform",
         "external",
         "cmake",
     },

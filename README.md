@@ -123,8 +123,11 @@ note[E99996]: failed to load dynamic library 'slang-glslang-0.0.0'
 - **构建工具由集成方负责，而非本依赖**。本依赖自身通过 Zig 自带的 C++ 工具链
   （`zig c++`，含 libc++）编译全部 C++ 源码，不要求集成方安装 CMake、g++ 或
   clang。集成方只需：
-  - 一个满足 `minimum_zig_version` 的 Zig；
-  - 可访问到本仓库的 `external/` 子模块源码（路径或 git 依赖时需一并取得）。
+  - 一个满足 `minimum_zig_version` 的 Zig。
+  - 首次构建需要能访问网络：Slang 的第三方源码（glslang、SPIRV-Tools、cmark、
+    miniz、lz4、lua、unordered_dense、fast_float、SPIRV-Headers）已在本依赖的
+    `build.zig.zon` 中声明为 git 依赖（仓库 URL + commit），Zig 会自动拉取并缓存。**无需手动 `git
+    submodule update`**（本地检出中若已初始化对应子模块，则直接复用、不联网）。
   - 若集成方目标平台（如交叉编译、其它 ABI）缺少合适的工具链，那属于集成方自
     行解决的问题，本依赖不为此负责。
 - 集成包含**两处代码/构建改动**：`linkLibrary(slang-glslang)`（步骤 2），以及创建
@@ -133,3 +136,12 @@ note[E99996]: failed to load dynamic library 'slang-glslang-0.0.0'
 - 首次构建需要从头编译整个 Slang 静态库，耗时与内存开销较大；这与上游 CMake
   构建一致，且无 PCH 加速。构建期还会运行一次 `slang-bootstrap` 预编译 core
   module（打印 `Compiling core module ...`，约数十秒），但这只发生在构建期。
+- **构建期工具固定以 `ReleaseFast` 构建，不跟随集成方的 `optimize`**：这些步骤
+  只在构建期运行、产物是生成数据或预编译的 core module，不进最终运行库，外部选
+  Debug 时对它们没有意义（反而拖慢构建）。固定为 fast 的步骤有：
+  `slang-embed`、`slang-generate`、`slang-capability-generator`、
+  `slang-lookup-generator`、`slang-spirv-embed-generator`、`slang-fiddle`、
+  `slang-bootstrap`、`slang-compiler-base`。
+  出厂产物（`libslang-compiler.a`、`libslang-glslang.a`）及它们链接的
+  `core`、`compiler-core`、`cmark-gfm`、`miniz`、`lz4`、`glslang`、
+  `SPIRV-Tools` 仍然跟随集成方的 `optimize`。

@@ -5,11 +5,40 @@ const std = @import("std");
 /// fallback and allow overriding through `-Dslang-version=...`.
 const default_slang_version = "0.0.0";
 
+/// Optimization used for build-time-only tools (the generators and the bootstrap
+/// compiler). Their output is generated data or a precompiled core module, so
+/// the consumer's chosen mode has no bearing on the shipped library's runtime;
+/// always building them optimized keeps the build itself fast even when the
+/// consumer selects Debug. `_DEBUG` for these tools still follows the external
+/// mode so it stays consistent with the core libraries they link against.
+const build_time_optimize: std.builtin.OptimizeMode = .ReleaseFast;
+
+/// Roots of the third-party source trees that upstream keeps as git submodules
+/// under `external/`.
+const External = struct {
+    unordered_dense: std.Build.LazyPath,
+    fast_float: std.Build.LazyPath,
+    spirv_headers: std.Build.LazyPath,
+    cmark: std.Build.LazyPath,
+    miniz: std.Build.LazyPath,
+    lz4: std.Build.LazyPath,
+    lua: std.Build.LazyPath,
+    glslang: std.Build.LazyPath,
+    spirv_tools: std.Build.LazyPath,
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
     const check = b.step("check", "Compile intermediate libraries without linking the final artifact");
+
+    // Resolve the third-party sources. This returns `null` when a needed source
+    // tree is neither checked out under `external/` nor fetched yet; returning
+    // here lets Zig fetch the pending lazy dependencies (declared in
+    // build.zig.zon) and run the configure phase again with them available.
+    const external = resolveExternal(b) orelse return;
+    const lua_include = luaIncludeDir(b, external);
 
     // miniz.h includes a generated "miniz_export.h" (normally produced by
     // CMake's generate_export_header). For a static build the export macro
@@ -22,7 +51,7 @@ pub fn build(b: *std.Build) void {
         \\
     );
 
-    const miniz = addMiniz(b, target, optimize, miniz_export.getDirectory());
+    const miniz = addMiniz(b, target, optimize, external.miniz, miniz_export.getDirectory());
 
     // cmark's config.h is generated from a template that only toggles
     // CMARK_THREADING (off by default upstream; Slang does not enable it).
@@ -35,13 +64,18 @@ pub fn build(b: *std.Build) void {
         \\
     );
 
-    const lz4 = addLz4(b, target, optimize);
-    const cmark = addCmark(b, target, optimize, cmark_config.getDirectory());
+    const lz4 = addLz4(b, target, optimize, external.lz4);
+    const cmark = addCmark(b, target, optimize, external.cmark, cmark_config.getDirectory());
 
-    // glslang + SPIRV-Tools and the `slang-glslang` module they back.
-    const spirv_tools = addSpirvTools(b, target, optimize);
-    const glslang = addGlslang(b, target, optimize);
-    const slang_glslang = addSlangGlslang(b, target, optimize, glslang, spirv_tools);
+    // glslang + SPIRV-Tools and the `slang-glslang` module they back. The grammar
+    // tables and glslang's `build_info.h` are the pre-generated copies checked
+    // into the repository (external/spirv-tools-generated, external/glslang-generated),
+    // so no Python or bison is required at build time.
+    const spirv_tools_generated = b.path("external/spirv-tools-generated");
+    const glslang_generated = b.path("external/glslang-generated");
+    const spirv_tools = addSpirvTools(b, target, optimize, external.spirv_tools, spirv_tools_generated, external.spirv_headers);
+    const glslang = addGlslang(b, target, optimize, external.glslang, glslang_generated, external.spirv_tools, spirv_tools_generated, external.spirv_headers);
+    const slang_glslang = addSlangGlslang(b, target, optimize, glslang, spirv_tools, external);
 
     const version_header = b.addWriteFiles();
     _ = version_header.add("slang-tag-version.h", b.fmt(
@@ -50,29 +84,29 @@ pub fn build(b: *std.Build) void {
         \\
     , .{ default_slang_version, default_slang_version }));
 
-    const core = addCore(b, target, optimize, miniz, lz4, miniz_export.getDirectory());
-    const compiler_core = addCompilerCore(b, target, optimize, core, version_header.getDirectory());
+    const core = addCore(b, target, optimize, external, miniz, lz4, miniz_export.getDirectory());
+    const compiler_core = addCompilerCore(b, target, optimize, external, core, version_header.getDirectory());
 
     // Host tools compiled from the repository itself (the "generators").
-    const embed_exe = addHostExecutable(b, target, optimize, "slang-embed", &.{
+    const embed_exe = addHostExecutable(b, target, optimize, external, lua_include, "slang-embed", &.{
         "tools/slang-embed/slang-embed.cpp",
     }, &.{core}, &.{});
-    const generate_exe = addHostExecutable(b, target, optimize, "slang-generate", &.{
+    const generate_exe = addHostExecutable(b, target, optimize, external, lua_include, "slang-generate", &.{
         "tools/slang-generate/main.cpp",
     }, &.{core}, &.{});
-    const capability_exe = addHostExecutable(b, target, optimize, "slang-capability-generator", &.{
+    const capability_exe = addHostExecutable(b, target, optimize, external, lua_include, "slang-capability-generator", &.{
         "tools/slang-capability-generator/capability-generator-main.cpp",
     }, &.{compiler_core}, &.{});
-    const lookup_exe = addHostExecutable(b, target, optimize, "slang-lookup-generator", &.{
+    const lookup_exe = addHostExecutable(b, target, optimize, external, lua_include, "slang-lookup-generator", &.{
         "tools/slang-lookup-generator/lookup-generator-main.cpp",
     }, &.{compiler_core}, &.{});
-    const spirv_embed_exe = addHostExecutable(b, target, optimize, "slang-spirv-embed-generator", &.{
+    const spirv_embed_exe = addHostExecutable(b, target, optimize, external, lua_include, "slang-spirv-embed-generator", &.{
         "tools/slang-spirv-embed-generator/spirv-embed-generator-main.cpp",
     }, &.{compiler_core}, &.{});
-    const fiddle_exe = addHostExecutable(b, target, optimize, "slang-fiddle",
+    const fiddle_exe = addHostExecutable(b, target, optimize, external, lua_include, "slang-fiddle",
         globSources(b, "tools/slang-fiddle", target), &.{compiler_core}, &.{});
 
-    const generated = runGenerators(b, embed_exe, generate_exe, capability_exe, lookup_exe, spirv_embed_exe, fiddle_exe);
+    const generated = runGenerators(b, embed_exe, generate_exe, capability_exe, lookup_exe, spirv_embed_exe, fiddle_exe, external.spirv_headers);
 
     // The generated standard-module configuration header tells the compiler
     // where to look for optional standard modules at runtime.
@@ -94,6 +128,8 @@ pub fn build(b: *std.Build) void {
         b,
         target,
         optimize,
+        build_time_optimize,
+        external,
         core,
         compiler_core,
         cmark,
@@ -111,6 +147,7 @@ pub fn build(b: *std.Build) void {
         b,
         target,
         optimize,
+        external,
         slang_base,
         generated,
         cmark_config.getDirectory(),
@@ -118,6 +155,11 @@ pub fn build(b: *std.Build) void {
         standard_module_config.getDirectory(),
     );
     const bootstrap_run = b.addRunArtifact(slang_bootstrap);
+    // The bootstrap tool prints progress ("Compiling core module ...") to stderr
+    // (slang-global-session.cpp). This Run step has output args, so Zig captures
+    // stderr and would treat that informational text as a diagnostic error.
+    // Capture (and discard) it so Zig does not flag it.
+    _ = bootstrap_run.captureStdErr();
     bootstrap_run.addArg("-compile-core-module");
     bootstrap_run.addArg("-archive-type");
     bootstrap_run.addArg("riff-lz4");
@@ -132,6 +174,8 @@ pub fn build(b: *std.Build) void {
         b,
         target,
         optimize,
+        optimize,
+        external,
         core,
         compiler_core,
         cmark,
@@ -174,6 +218,73 @@ pub fn build(b: *std.Build) void {
     check.dependOn(&slang.step);
 }
 
+/// Resolves every third-party source tree the build needs.
+///
+/// Upstream keeps these as git submodules under `external/`, which works for a
+/// normal checkout but not for a Zig package fetched as a GitHub archive (an
+/// archive cannot carry submodule contents). Each tree therefore resolves in
+/// two stages: the checked-out `external/<name>` is preferred when it exists
+/// (offline, no download), otherwise the Zig dependency of the same name
+/// declared in `build.zig.zon` is used.
+///
+/// Every `lazyDependency` call is made before the first `null` is surfaced, so
+/// one fetch round can satisfy all of the missing dependencies.
+fn resolveExternal(b: *std.Build) ?External {
+    const unordered_dense = externalRoot(b, "unordered_dense", "external/unordered_dense");
+    const fast_float = externalRoot(b, "fast_float", "external/fast_float");
+    const spirv_headers = externalRoot(b, "spirv_headers", "external/spirv-headers");
+    const cmark = externalRoot(b, "cmark", "external/cmark");
+    const miniz = externalRoot(b, "miniz", "external/miniz");
+    const lz4 = externalRoot(b, "lz4", "external/lz4");
+    const lua = externalRoot(b, "lua", "external/lua");
+    const glslang = externalRoot(b, "glslang", "external/glslang");
+    const spirv_tools = externalRoot(b, "spirv_tools", "external/spirv-tools");
+    return .{
+        .unordered_dense = unordered_dense orelse return null,
+        .fast_float = fast_float orelse return null,
+        .spirv_headers = spirv_headers orelse return null,
+        .cmark = cmark orelse return null,
+        .miniz = miniz orelse return null,
+        .lz4 = lz4 orelse return null,
+        .lua = lua orelse return null,
+        .glslang = glslang orelse return null,
+        .spirv_tools = spirv_tools orelse return null,
+    };
+}
+
+/// Returns the root of one third-party tree: the checked-out submodule when
+/// present, otherwise the corresponding (lazy) Zig dependency.
+fn externalRoot(b: *std.Build, dep_name: []const u8, local_dir: []const u8) ?std.Build.LazyPath {
+    if (isPopulatedDir(b, local_dir)) return b.path(local_dir);
+    const dep = b.lazyDependency(dep_name, .{}) orelse return null;
+    return dep.path(".");
+}
+
+/// True only when `rel` names a directory that actually has contents.
+///
+/// A git clone whose submodules were never initialized leaves the submodule
+/// paths present but empty. Treating those as available would point the build at
+/// missing sources (for example `external/spirv-tools/source`), so an empty
+/// directory must fall through to the Zig dependency instead.
+fn isPopulatedDir(b: *std.Build, rel: []const u8) bool {
+    var d = std.fs.cwd().openDir(b.pathFromRoot(rel), .{ .iterate = true }) catch return false;
+    defer d.close();
+    var it = d.iterate();
+    return (it.next() catch return false) != null;
+}
+
+/// Directory that satisfies `#include "lua/onelua.c"` in the slang-fiddle host
+/// tool. When the lua submodule is checked out, `external/` already contains a
+/// `lua/` entry. When lua comes from a Zig dependency, its package root has no
+/// `lua/` path component, so the tree is copied into a generated directory
+/// under a `lua/` subdirectory to preserve that include spelling.
+fn luaIncludeDir(b: *std.Build, external: External) std.Build.LazyPath {
+    if (isPopulatedDir(b, "external/lua")) return b.path("external");
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyDirectory(external.lua, "lua", .{});
+    return wf.getDirectory();
+}
+
 const Generated = struct {
     /// Directory holding the generated `.fiddle` headers.
     fiddle_dir: std.Build.LazyPath,
@@ -203,8 +314,9 @@ fn runGenerators(
     lookup_exe: *std.Build.Step.Compile,
     spirv_embed_exe: *std.Build.Step.Compile,
     fiddle_exe: *std.Build.Step.Compile,
+    spirv_headers_root: std.Build.LazyPath,
 ) Generated {
-    const spirv_headers = b.path("external/spirv-headers/include");
+    const spirv_headers = spirv_headers_root.path(b, "include");
 
     var steps: std.ArrayList(*std.Build.Step) = .empty;
 
@@ -309,6 +421,8 @@ fn addSlang(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    module_optimize: std.builtin.OptimizeMode,
+    external: External,
     core: *std.Build.Step.Compile,
     compiler_core: *std.Build.Step.Compile,
     cmark: *std.Build.Step.Compile,
@@ -321,7 +435,7 @@ fn addSlang(
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
-        .optimize = optimize,
+        .optimize = module_optimize,
         .link_libc = true,
         .link_libcpp = true,
     });
@@ -330,12 +444,12 @@ fn addSlang(
     mod.addIncludePath(b.path("source/slang"));
     mod.addIncludePath(b.path("tools"));
     mod.addIncludePath(b.path("external"));
-    mod.addIncludePath(b.path("external/unordered_dense/include"));
-    mod.addIncludePath(b.path("external/fast_float/include"));
-    mod.addIncludePath(b.path("external/spirv-headers/include"));
+    mod.addIncludePath(external.unordered_dense.path(b, "include"));
+    mod.addIncludePath(external.fast_float.path(b, "include"));
+    mod.addIncludePath(external.spirv_headers.path(b, "include"));
     mod.addIncludePath(cmark_config_dir);
-    mod.addIncludePath(b.path("external/cmark/src/include"));
-    mod.addIncludePath(b.path("external/cmark/extensions/include"));
+    mod.addIncludePath(external.cmark.path(b, "src/include"));
+    mod.addIncludePath(external.cmark.path(b, "extensions/include"));
     mod.addIncludePath(version_header_dir);
     mod.addIncludePath(standard_module_config_dir);
     mod.addIncludePath(generated.capability_dir);
@@ -402,6 +516,7 @@ fn addSlangBootstrap(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    external: External,
     slang_lib: *std.Build.Step.Compile,
     generated: Generated,
     cmark_config_dir: std.Build.LazyPath,
@@ -410,7 +525,7 @@ fn addSlangBootstrap(
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
-        .optimize = optimize,
+        .optimize = build_time_optimize,
         .link_libc = true,
         .link_libcpp = true,
     });
@@ -419,12 +534,12 @@ fn addSlangBootstrap(
     mod.addIncludePath(b.path("source/slang"));
     mod.addIncludePath(b.path("tools"));
     mod.addIncludePath(b.path("external"));
-    mod.addIncludePath(b.path("external/unordered_dense/include"));
-    mod.addIncludePath(b.path("external/fast_float/include"));
-    mod.addIncludePath(b.path("external/spirv-headers/include"));
+    mod.addIncludePath(external.unordered_dense.path(b, "include"));
+    mod.addIncludePath(external.fast_float.path(b, "include"));
+    mod.addIncludePath(external.spirv_headers.path(b, "include"));
     mod.addIncludePath(cmark_config_dir);
-    mod.addIncludePath(b.path("external/cmark/src/include"));
-    mod.addIncludePath(b.path("external/cmark/extensions/include"));
+    mod.addIncludePath(external.cmark.path(b, "src/include"));
+    mod.addIncludePath(external.cmark.path(b, "extensions/include"));
     mod.addIncludePath(version_header_dir);
     mod.addIncludePath(standard_module_config_dir);
     mod.addIncludePath(generated.capability_dir);
@@ -445,6 +560,8 @@ fn addHostExecutable(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    external: External,
+    lua_include: std.Build.LazyPath,
     name: []const u8,
     sources: []const []const u8,
     libs: []const *std.Build.Step.Compile,
@@ -452,16 +569,17 @@ fn addHostExecutable(
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
-        .optimize = optimize,
+        .optimize = build_time_optimize,
         .link_libc = true,
         .link_libcpp = true,
     });
     mod.addIncludePath(b.path("source"));
     mod.addIncludePath(b.path("include"));
     mod.addIncludePath(b.path("external"));
-    mod.addIncludePath(b.path("external/unordered_dense/include"));
-    mod.addIncludePath(b.path("external/fast_float/include"));
-    mod.addIncludePath(b.path("external/spirv-headers/include"));
+    mod.addIncludePath(external.unordered_dense.path(b, "include"));
+    mod.addIncludePath(external.fast_float.path(b, "include"));
+    mod.addIncludePath(external.spirv_headers.path(b, "include"));
+    mod.addIncludePath(lua_include);
     var flags: std.ArrayList([]const u8) = .empty;
     flags.appendSlice(b.allocator, slangDefines(b, optimize)) catch @panic("out of memory");
     flags.appendSlice(b.allocator, extra_flags) catch @panic("out of memory");
@@ -528,6 +646,7 @@ fn addCore(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    external: External,
     miniz: *std.Build.Step.Compile,
     lz4: *std.Build.Step.Compile,
     miniz_export_dir: std.Build.LazyPath,
@@ -540,10 +659,10 @@ fn addCore(
     });
     mod.addIncludePath(b.path("source"));
     mod.addIncludePath(b.path("include"));
-    mod.addIncludePath(b.path("external/unordered_dense/include"));
-    mod.addIncludePath(b.path("external/miniz"));
+    mod.addIncludePath(external.unordered_dense.path(b, "include"));
+    mod.addIncludePath(external.miniz);
     mod.addIncludePath(miniz_export_dir);
-    mod.addIncludePath(b.path("external/lz4/lib"));
+    mod.addIncludePath(external.lz4.path(b, "lib"));
     mod.addCSourceFiles(.{
         .files = globSources(b, "source/core", target),
         .flags = slangDefines(b, optimize),
@@ -557,6 +676,7 @@ fn addCompilerCore(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    external: External,
     core: *std.Build.Step.Compile,
     version_header_dir: std.Build.LazyPath,
 ) *std.Build.Step.Compile {
@@ -569,9 +689,9 @@ fn addCompilerCore(
     mod.addIncludePath(b.path("source"));
     mod.addIncludePath(b.path("include"));
     mod.addIncludePath(b.path("external"));
-    mod.addIncludePath(b.path("external/fast_float/include"));
-    mod.addIncludePath(b.path("external/spirv-headers/include"));
-    mod.addIncludePath(b.path("external/unordered_dense/include"));
+    mod.addIncludePath(external.fast_float.path(b, "include"));
+    mod.addIncludePath(external.spirv_headers.path(b, "include"));
+    mod.addIncludePath(external.unordered_dense.path(b, "include"));
     mod.addIncludePath(version_header_dir);
 
     for (globSources(b, "source/compiler-core", target)) |file| {
@@ -598,6 +718,7 @@ fn addMiniz(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    miniz_root: std.Build.LazyPath,
     export_dir: std.Build.LazyPath,
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
@@ -605,37 +726,43 @@ fn addMiniz(
         .optimize = optimize,
         .link_libc = true,
     });
-    mod.addIncludePath(b.path("external/miniz"));
+    mod.addIncludePath(miniz_root);
     mod.addIncludePath(export_dir);
-    mod.addCSourceFiles(.{
-        .files = &.{
-            "external/miniz/miniz.c",
-            "external/miniz/miniz_zip.c",
-            "external/miniz/miniz_tinfl.c",
-            "external/miniz/miniz_tdef.c",
-        },
-        .flags = &.{ "-std=gnu99", "-DMINIZ_STATIC_DEFINE" },
-    });
+    const flags = &.{ "-std=gnu99", "-DMINIZ_STATIC_DEFINE" };
+    for ([_][]const u8{
+        "miniz.c",
+        "miniz_zip.c",
+        "miniz_tinfl.c",
+        "miniz_tdef.c",
+    }) |name| {
+        mod.addCSourceFile(.{ .file = miniz_root.path(b, name), .flags = flags });
+    }
     return b.addLibrary(.{ .name = "miniz", .linkage = .static, .root_module = mod });
 }
 
-fn addLz4(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+fn addLz4(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    lz4_root: std.Build.LazyPath,
+) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    mod.addIncludePath(b.path("external/lz4/lib"));
-    mod.addCSourceFiles(.{
-        .files = &.{
-            "external/lz4/lib/lz4.c",
-            "external/lz4/lib/lz4file.c",
-            "external/lz4/lib/lz4frame.c",
-            "external/lz4/lib/lz4hc.c",
-            "external/lz4/lib/xxhash.c",
-        },
-        .flags = &.{ "-std=gnu99", "-DXXH_NAMESPACE=LZ4_" },
-    });
+    const lib = lz4_root.path(b, "lib");
+    mod.addIncludePath(lib);
+    const flags = &.{ "-std=gnu99", "-DXXH_NAMESPACE=LZ4_" };
+    for ([_][]const u8{
+        "lz4.c",
+        "lz4file.c",
+        "lz4frame.c",
+        "lz4hc.c",
+        "xxhash.c",
+    }) |name| {
+        mod.addCSourceFile(.{ .file = lib.path(b, name), .flags = flags });
+    }
     return b.addLibrary(.{ .name = "lz4", .linkage = .static, .root_module = mod });
 }
 
@@ -643,6 +770,7 @@ fn addCmark(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    cmark_root: std.Build.LazyPath,
     config_dir: std.Build.LazyPath,
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
@@ -651,42 +779,43 @@ fn addCmark(
         .link_libc = true,
     });
     mod.addIncludePath(config_dir);
-    mod.addIncludePath(b.path("external/cmark/src/include"));
-    mod.addIncludePath(b.path("external/cmark/extensions/include"));
+    mod.addIncludePath(cmark_root.path(b, "src/include"));
+    mod.addIncludePath(cmark_root.path(b, "extensions/include"));
     mod.addCMacro("CMARK_USE_CMAKE_HEADERS", "1");
     mod.addCMacro("CMARK_GFM_STATIC_DEFINE", "1");
-    mod.addCSourceFiles(.{
-        .files = &.{
-            "external/cmark/src/arena.c",
-            "external/cmark/src/blocks.c",
-            "external/cmark/src/buffer.c",
-            "external/cmark/src/cmark.c",
-            "external/cmark/src/cmark_ctype.c",
-            "external/cmark/src/commonmark.c",
-            "external/cmark/src/footnotes.c",
-            "external/cmark/src/houdini_href_e.c",
-            "external/cmark/src/houdini_html_e.c",
-            "external/cmark/src/houdini_html_u.c",
-            "external/cmark/src/html.c",
-            "external/cmark/src/inlines.c",
-            "external/cmark/src/iterator.c",
-            "external/cmark/src/latex.c",
-            "external/cmark/src/linked_list.c",
-            "external/cmark/src/man.c",
-            "external/cmark/src/map.c",
-            "external/cmark/src/node.c",
-            "external/cmark/src/plaintext.c",
-            "external/cmark/src/plugin.c",
-            "external/cmark/src/references.c",
-            "external/cmark/src/registry.c",
-            "external/cmark/src/render.c",
-            "external/cmark/src/scanners.c",
-            "external/cmark/src/syntax_extension.c",
-            "external/cmark/src/utf8.c",
-            "external/cmark/src/xml.c",
-        },
-        .flags = &.{"-std=c99"},
-    });
+    const src = cmark_root.path(b, "src");
+    const flags = &.{"-std=c99"};
+    for ([_][]const u8{
+        "arena.c",
+        "blocks.c",
+        "buffer.c",
+        "cmark.c",
+        "cmark_ctype.c",
+        "commonmark.c",
+        "footnotes.c",
+        "houdini_href_e.c",
+        "houdini_html_e.c",
+        "houdini_html_u.c",
+        "html.c",
+        "inlines.c",
+        "iterator.c",
+        "latex.c",
+        "linked_list.c",
+        "man.c",
+        "map.c",
+        "node.c",
+        "plaintext.c",
+        "plugin.c",
+        "references.c",
+        "registry.c",
+        "render.c",
+        "scanners.c",
+        "syntax_extension.c",
+        "utf8.c",
+        "xml.c",
+    }) |name| {
+        mod.addCSourceFile(.{ .file = src.path(b, name), .flags = flags });
+    }
     return b.addLibrary(.{ .name = "cmark-gfm", .linkage = .static, .root_module = mod });
 }
 
@@ -735,12 +864,15 @@ fn isUnix(os: std.Target.Os.Tag) bool {
     };
 }
 
-/// Recursively collects `.cpp` files under `dir`, skipping any whose path
-/// contains one of `excludes`.
-fn globCpp(b: *std.Build, dir: []const u8, excludes: []const []const u8) []const []const u8 {
-    var list: std.ArrayList([]const u8) = .empty;
-    var d = b.build_root.handle.openDir(dir, .{ .iterate = true }) catch |err| {
-        std.debug.panic("unable to open source directory '{s}': {s}", .{ dir, @errorName(err) });
+/// Recursively collects the `.cpp` files under `root`, skipping any whose
+/// relative path contains one of `excludes`, and returns them as lazy paths so
+/// the caller can add them from either a checked-out `external/` directory or a
+/// Zig dependency (which lives outside the build root).
+fn globCpp(b: *std.Build, root: std.Build.LazyPath, excludes: []const []const u8) []std.Build.LazyPath {
+    var list: std.ArrayList(std.Build.LazyPath) = .empty;
+    const abs = root.getPath(b);
+    var d = std.fs.cwd().openDir(abs, .{ .iterate = true }) catch |err| {
+        std.debug.panic("unable to open source directory '{s}': {s}", .{ abs, @errorName(err) });
     };
     defer d.close();
     var walker = d.walk(b.allocator) catch @panic("out of memory");
@@ -756,13 +888,13 @@ fn globCpp(b: *std.Build, dir: []const u8, excludes: []const []const u8) []const
             }
         }
         if (excluded) continue;
-        list.append(b.allocator, b.pathJoin(&.{ dir, entry.path })) catch @panic("out of memory");
+        list.append(b.allocator, root.path(b, entry.path)) catch @panic("out of memory");
     }
     return list.toOwnedSlice(b.allocator) catch @panic("out of memory");
 }
 
 //
-// glslang + SPIRV-Tools, used by the dlopen'd `slang-glslang` module that
+// glslang + SPIRV-Tools, used by the in-process `slang-glslang` module that
 // provides spirv-opt / spirv-val / spirv-link. The grammar tables and glslang's
 // `build_info.h` are the pre-generated copies checked into the repository
 // (external/spirv-tools-generated, external/glslang-generated), so no Python or
@@ -773,6 +905,9 @@ fn addSpirvTools(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    spirv_tools_root: std.Build.LazyPath,
+    generated_root: std.Build.LazyPath,
+    spirv_headers_root: std.Build.LazyPath,
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
@@ -781,20 +916,20 @@ fn addSpirvTools(
         .link_libcpp = true,
         .pic = true,
     });
-    mod.addIncludePath(b.path("external/spirv-tools"));
-    mod.addIncludePath(b.path("external/spirv-tools/include"));
-    mod.addIncludePath(b.path("external/spirv-tools-generated"));
-    mod.addIncludePath(b.path("external/spirv-headers/include"));
-    mod.addCSourceFiles(.{
-        .files = globCpp(b, "external/spirv-tools/source", &.{
-            "fuzz/",
-            "wasm/",
-            "pch",
-            "mimalloc.cpp",
-            "util/timer.cpp",
-        }),
-        .flags = &.{ "-std=c++17", "-w" },
-    });
+    mod.addIncludePath(spirv_tools_root);
+    mod.addIncludePath(spirv_tools_root.path(b, "include"));
+    mod.addIncludePath(generated_root);
+    mod.addIncludePath(spirv_headers_root.path(b, "include"));
+    const flags = &.{ "-std=c++17", "-w" };
+    for (globCpp(b, spirv_tools_root.path(b, "source"), &.{
+        "fuzz/",
+        "wasm/",
+        "pch",
+        "mimalloc.cpp",
+        "util/timer.cpp",
+    })) |file| {
+        mod.addCSourceFile(.{ .file = file, .flags = flags });
+    }
     return b.addLibrary(.{ .name = "SPIRV-Tools", .linkage = .static, .root_module = mod });
 }
 
@@ -802,6 +937,11 @@ fn addGlslang(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    glslang_root: std.Build.LazyPath,
+    glslang_generated_root: std.Build.LazyPath,
+    spirv_tools_root: std.Build.LazyPath,
+    spirv_tools_generated_root: std.Build.LazyPath,
+    spirv_headers_root: std.Build.LazyPath,
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
@@ -810,11 +950,11 @@ fn addGlslang(
         .link_libcpp = true,
         .pic = true,
     });
-    mod.addIncludePath(b.path("external/glslang"));
-    mod.addIncludePath(b.path("external/glslang-generated"));
-    mod.addIncludePath(b.path("external/spirv-tools/include"));
-    mod.addIncludePath(b.path("external/spirv-tools-generated"));
-    mod.addIncludePath(b.path("external/spirv-headers/include"));
+    mod.addIncludePath(glslang_root);
+    mod.addIncludePath(glslang_generated_root);
+    mod.addIncludePath(spirv_tools_root.path(b, "include"));
+    mod.addIncludePath(spirv_tools_generated_root);
+    mod.addIncludePath(spirv_headers_root.path(b, "include"));
     mod.addCMacro("ENABLE_HLSL", "1");
     mod.addCMacro("ENABLE_OPT", "1");
 
@@ -826,14 +966,12 @@ fn addGlslang(
     var os_excludes: std.ArrayList([]const u8) = .empty;
     os_excludes.appendSlice(b.allocator, &.{"stub.cpp"}) catch @panic("out of memory");
     os_excludes.appendSlice(b.allocator, os_exclude) catch @panic("out of memory");
-    mod.addCSourceFiles(.{
-        .files = globCpp(b, "external/glslang/glslang", os_excludes.items),
-        .flags = flags,
-    });
-    mod.addCSourceFiles(.{
-        .files = globCpp(b, "external/glslang/SPIRV", &.{}),
-        .flags = flags,
-    });
+    for (globCpp(b, glslang_root.path(b, "glslang"), os_excludes.items)) |file| {
+        mod.addCSourceFile(.{ .file = file, .flags = flags });
+    }
+    for (globCpp(b, glslang_root.path(b, "SPIRV"), &.{})) |file| {
+        mod.addCSourceFile(.{ .file = file, .flags = flags });
+    }
     return b.addLibrary(.{ .name = "glslang", .linkage = .static, .root_module = mod });
 }
 
@@ -843,6 +981,7 @@ fn addSlangGlslang(
     optimize: std.builtin.OptimizeMode,
     glslang: *std.Build.Step.Compile,
     spirv_tools: *std.Build.Step.Compile,
+    external: External,
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
@@ -854,9 +993,9 @@ fn addSlangGlslang(
     mod.addIncludePath(b.path("include"));
     mod.addIncludePath(b.path("source"));
     mod.addIncludePath(b.path("source/slang-glslang"));
-    mod.addIncludePath(b.path("external/glslang"));
-    mod.addIncludePath(b.path("external/spirv-tools/include"));
-    mod.addIncludePath(b.path("external/spirv-headers/include"));
+    mod.addIncludePath(external.glslang);
+    mod.addIncludePath(external.spirv_tools.path(b, "include"));
+    mod.addIncludePath(external.spirv_headers.path(b, "include"));
     mod.addCSourceFiles(.{
         .files = &.{
             "source/slang-glslang/slang-glslang.cpp",
