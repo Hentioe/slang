@@ -140,3 +140,8 @@ note[E99996]: failed to load dynamic library 'slang-glslang-0.0.0'
   NixOS）中构建、导致这些工具无法执行（`FileNotFound`/ENOENT），可在依赖参数里传
   `.host_musl_static = true`，让它们改为 musl 静态链接；直接构建本仓库时等价于
   `zig build -Dhost_musl_static=true`（默认 `false`，即默认 libc）。
+- **需要把静态库链接进共享库时启用 PIC**。默认构建不会显式要求目标侧静态库以
+  位置无关代码编译；若集成方要把 `libslang-compiler.a` / `libslang-glslang.a`
+  再链接进自己的 `.so`，需要传 `.pic = true`（直接构建时等价于
+  `zig build -Dpic=true`）。该选项只影响目标侧库，构建期 host 工具保持原样。
+  它本身不产出 `.so`，共享库仍由集成方创建。

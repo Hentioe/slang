@@ -68,6 +68,17 @@ pub fn build(b: *std.Build) void {
         "Build the build-time host tools (generators and bootstrap) as static musl executables instead of using the default libc",
     ) orelse false;
 
+    // Whether target-side libraries are forced to compile as position-independent
+    // code. Needed when the static archives are linked into a shared library (for
+    // example a consumer-side `libslang.so`). When disabled, modules keep Zig's
+    // target default (`null`) instead of explicitly requesting `-fno-PIC`;
+    // build-time host libraries also keep the target default.
+    const pic = b.option(
+        bool,
+        "pic",
+        "Build target-side static libraries as position-independent code (for linking them into a shared library)",
+    ) orelse false;
+
     // Target for the build-time host tools and the libraries they link.
     const host_target = hostTarget(b, target, host_musl_static);
 
@@ -82,8 +93,8 @@ pub fn build(b: *std.Build) void {
         \\
     );
 
-    const miniz = addMiniz(b, target, optimize, external.miniz, miniz_export.getDirectory());
-    const miniz_host = addMiniz(b, host_target, build_time_optimize, external.miniz, miniz_export.getDirectory());
+    const miniz = addMiniz(b, target, optimize, external.miniz, miniz_export.getDirectory(), pic);
+    const miniz_host = addMiniz(b, host_target, build_time_optimize, external.miniz, miniz_export.getDirectory(), false);
 
     // cmark's config.h is generated from a template that only toggles
     // CMARK_THREADING (off by default upstream; Slang does not enable it).
@@ -96,10 +107,10 @@ pub fn build(b: *std.Build) void {
         \\
     );
 
-    const lz4 = addLz4(b, target, optimize, external.lz4);
-    const cmark = addCmark(b, target, optimize, external.cmark, cmark_config.getDirectory());
-    const lz4_host = addLz4(b, host_target, build_time_optimize, external.lz4);
-    const cmark_host = addCmark(b, host_target, build_time_optimize, external.cmark, cmark_config.getDirectory());
+    const lz4 = addLz4(b, target, optimize, external.lz4, pic);
+    const cmark = addCmark(b, target, optimize, external.cmark, cmark_config.getDirectory(), pic);
+    const lz4_host = addLz4(b, host_target, build_time_optimize, external.lz4, false);
+    const cmark_host = addCmark(b, host_target, build_time_optimize, external.cmark, cmark_config.getDirectory(), false);
 
     // glslang + SPIRV-Tools and the `slang-glslang` module they back. The grammar
     // tables and glslang's `build_info.h` are the pre-generated copies checked
@@ -118,14 +129,14 @@ pub fn build(b: *std.Build) void {
         \\
     , .{ default_slang_version, default_slang_version }));
 
-    const core = addCore(b, target, optimize, external, miniz, lz4, miniz_export.getDirectory());
-    const compiler_core = addCompilerCore(b, target, optimize, external, core, version_header.getDirectory());
+    const core = addCore(b, target, optimize, external, miniz, lz4, miniz_export.getDirectory(), pic);
+    const compiler_core = addCompilerCore(b, target, optimize, external, core, version_header.getDirectory(), pic);
 
     // Host variants, used only by the build-time tools/generators and the
     // bootstrap compiler. They are built for `host_target` so they can be
     // executed during the build.
-    const core_host = addCore(b, host_target, build_time_optimize, external, miniz_host, lz4_host, miniz_export.getDirectory());
-    const compiler_core_host = addCompilerCore(b, host_target, build_time_optimize, external, core_host, version_header.getDirectory());
+    const core_host = addCore(b, host_target, build_time_optimize, external, miniz_host, lz4_host, miniz_export.getDirectory(), false);
+    const compiler_core_host = addCompilerCore(b, host_target, build_time_optimize, external, core_host, version_header.getDirectory(), false);
 
     // Host tools compiled from the repository itself (the "generators").
     const embed_exe = addHostExecutable(b, host_target, optimize, external, lua_include, "slang-embed", &.{
@@ -178,6 +189,7 @@ pub fn build(b: *std.Build) void {
         standard_module_config.getDirectory(),
         "slang-compiler-base",
         null,
+        false,
     );
 
     // Precompile the core module at build time, so creating a global session at
@@ -224,6 +236,7 @@ pub fn build(b: *std.Build) void {
         standard_module_config.getDirectory(),
         "slang-compiler",
         core_module_header.dirname(),
+        pic,
     );
 
     // The default `zig build` produces (and installs) the Slang compiler
@@ -522,12 +535,14 @@ fn addSlang(
     standard_module_config_dir: std.Build.LazyPath,
     name: []const u8,
     embedded_core_header_dir: ?std.Build.LazyPath,
+    pic: bool,
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
         .optimize = module_optimize,
         .link_libc = true,
         .link_libcpp = true,
+        .pic = if (pic) true else null,
     });
     mod.addIncludePath(b.path("source"));
     mod.addIncludePath(b.path("include"));
@@ -754,12 +769,14 @@ fn addCore(
     miniz: *std.Build.Step.Compile,
     lz4: *std.Build.Step.Compile,
     miniz_export_dir: std.Build.LazyPath,
+    pic: bool,
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .link_libcpp = true,
+        .pic = if (pic) true else null,
     });
     mod.addIncludePath(b.path("source"));
     mod.addIncludePath(b.path("include"));
@@ -783,12 +800,14 @@ fn addCompilerCore(
     external: External,
     core: *std.Build.Step.Compile,
     version_header_dir: std.Build.LazyPath,
+    pic: bool,
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .link_libcpp = true,
+        .pic = if (pic) true else null,
     });
     mod.addIncludePath(b.path("source"));
     mod.addIncludePath(b.path("include"));
@@ -824,11 +843,13 @@ fn addMiniz(
     optimize: std.builtin.Optimize,
     miniz_root: std.Build.LazyPath,
     export_dir: std.Build.LazyPath,
+    pic: bool,
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .pic = if (pic) true else null,
     });
     mod.addIncludePath(miniz_root);
     mod.addIncludePath(export_dir);
@@ -849,11 +870,13 @@ fn addLz4(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.Optimize,
     lz4_root: std.Build.LazyPath,
+    pic: bool,
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .pic = if (pic) true else null,
     });
     const lib = lz4_root.path(b, "lib");
     mod.addIncludePath(lib);
@@ -876,11 +899,13 @@ fn addCmark(
     optimize: std.builtin.Optimize,
     cmark_root: std.Build.LazyPath,
     config_dir: std.Build.LazyPath,
+    pic: bool,
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .pic = if (pic) true else null,
     });
     mod.addIncludePath(config_dir);
     mod.addIncludePath(cmark_root.path(b, "src/include"));
