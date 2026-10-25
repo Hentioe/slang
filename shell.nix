@@ -1,7 +1,7 @@
 with import <nixpkgs> { };
 let
   # 覆盖 Zig 命令，使用 zvm 运行 Zig
-  custom-zig = writeShellScriptBin "zig" "exec zvm run 0.15.2 $@";
+  custom-zig = writeShellScriptBin "zig" "exec zvm run 0.17.0 $@";
 in
 mkShell {
   packages = [

@@ -1,7 +1,7 @@
 .{
     .name = .slang,
     .version = "0.0.0",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0x681d367c56e59a99,
     // Third-party sources are git submodules upstream. A git submodule cannot
     // travel inside a Zig package tarball, so every one of them is also declared
@@ -38,7 +38,7 @@
         },
         .lz4 = .{
             .url = "git+https://github.com/lz4/lz4#7f71be01f2c6f6b2c3cddb67eef8c38eab12ffd4",
-            .hash = "N-V-__8AAP-yGQAy2Cxpgf_sINTVgcT8XA_4C0Zeh9cJR4_G",
+            .hash = "N-V-__8AAKOqGQCysq2jjhgmquFBiN6ILn-Za5_nTtK8gDWD",
             .lazy = true,
         },
         .lua = .{

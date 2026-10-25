@@ -11,7 +11,7 @@ const default_slang_version = "0.0.0";
 /// always building them optimized keeps the build itself fast even when the
 /// consumer selects Debug. `_DEBUG` for these tools still follows the external
 /// mode so it stays consistent with the core libraries they link against.
-const build_time_optimize: std.builtin.OptimizeMode = .ReleaseFast;
+const build_time_optimize: std.builtin.Optimize = .fast;
 
 /// Target used for the build-time host tools (the generators and the bootstrap
 /// compiler) and the libraries they link.
@@ -53,11 +53,11 @@ pub fn build(b: *std.Build) void {
 
     const check = b.step("check", "Compile intermediate libraries without linking the final artifact");
 
-    // Resolve the third-party sources. This returns `null` when a needed source
-    // tree is neither checked out under `external/` nor fetched yet; returning
-    // here lets Zig fetch the pending lazy dependencies (declared in
-    // build.zig.zon) and run the configure phase again with them available.
-    const external = resolveExternal(b) orelse return;
+    // Resolve the third-party sources. When a source tree is neither checked
+    // out under `external/` nor fetched yet, `resolveExternal` records every
+    // missing lazy dependency and then exits the configure phase so Zig can
+    // fetch them and run the build script again (see its doc comment).
+    const external = resolveExternal(b);
     const lua_include = luaIncludeDir(b, external);
 
     // Whether the build-time host tools are linked statically against musl
@@ -143,8 +143,7 @@ pub fn build(b: *std.Build) void {
     const spirv_embed_exe = addHostExecutable(b, host_target, optimize, external, lua_include, "slang-spirv-embed-generator", &.{
         "tools/slang-spirv-embed-generator/spirv-embed-generator-main.cpp",
     }, &.{compiler_core_host}, &.{});
-    const fiddle_exe = addHostExecutable(b, host_target, optimize, external, lua_include, "slang-fiddle",
-        globSources(b, "tools/slang-fiddle", host_target), &.{compiler_core_host}, &.{});
+    const fiddle_exe = addHostExecutable(b, host_target, optimize, external, lua_include, "slang-fiddle", globSources(b, "tools/slang-fiddle", host_target), &.{compiler_core_host}, &.{});
 
     const generated = runGenerators(b, embed_exe, generate_exe, capability_exe, lookup_exe, spirv_embed_exe, fiddle_exe, external.spirv_headers);
 
@@ -199,7 +198,7 @@ pub fn build(b: *std.Build) void {
     // (slang-global-session.cpp). This Run step has output args, so Zig captures
     // stderr and would treat that informational text as a diagnostic error.
     // Capture (and discard) it so Zig does not flag it.
-    _ = bootstrap_run.captureStdErr();
+    _ = bootstrap_run.captureStdErr(.{});
     bootstrap_run.addArg("-compile-core-module");
     bootstrap_run.addArg("-archive-type");
     bootstrap_run.addArg("riff-lz4");
@@ -281,8 +280,11 @@ pub fn build(b: *std.Build) void {
 /// declared in `build.zig.zon` is used.
 ///
 /// Every `lazyDependency` call is made before the first `null` is surfaced, so
-/// one fetch round can satisfy all of the missing dependencies.
-fn resolveExternal(b: *std.Build) ?External {
+/// one fetch round can satisfy all of the missing dependencies. If any are
+/// missing, this function exits the configure phase (via `dependency`) instead
+/// of returning, because a package's install steps must exist before the
+/// consumer can call `Dependency.artifact`.
+fn resolveExternal(b: *std.Build) External {
     const unordered_dense = externalRoot(b, "unordered_dense", "external/unordered_dense");
     const fast_float = externalRoot(b, "fast_float", "external/fast_float");
     const spirv_headers = externalRoot(b, "spirv_headers", "external/spirv-headers");
@@ -292,16 +294,50 @@ fn resolveExternal(b: *std.Build) ?External {
     const lua = externalRoot(b, "lua", "external/lua");
     const glslang = externalRoot(b, "glslang", "external/glslang");
     const spirv_tools = externalRoot(b, "spirv_tools", "external/spirv-tools");
+
+    const found = [_]?std.Build.LazyPath{
+        unordered_dense,
+        fast_float,
+        spirv_headers,
+        cmark,
+        miniz,
+        lz4,
+        lua,
+        glslang,
+        spirv_tools,
+    };
+    const names = [_][]const u8{
+        "unordered_dense",
+        "fast_float",
+        "spirv_headers",
+        "cmark",
+        "miniz",
+        "lz4",
+        "lua",
+        "glslang",
+        "spirv_tools",
+    };
+    for (found, names) |path, name| {
+        if (path != null) continue;
+        // Every missing dependency has already been marked by the
+        // `lazyDependency` calls above, so a single fetch round can satisfy all
+        // of them. Calling `dependency` (rather than returning) is essential:
+        // `lazyDependency` only records the need, and if this package's build
+        // returned normally the consumer would then call `Dependency.artifact`
+        // and panic because our install steps were never created.
+        _ = b.dependency(name, .{});
+        unreachable;
+    }
     return .{
-        .unordered_dense = unordered_dense orelse return null,
-        .fast_float = fast_float orelse return null,
-        .spirv_headers = spirv_headers orelse return null,
-        .cmark = cmark orelse return null,
-        .miniz = miniz orelse return null,
-        .lz4 = lz4 orelse return null,
-        .lua = lua orelse return null,
-        .glslang = glslang orelse return null,
-        .spirv_tools = spirv_tools orelse return null,
+        .unordered_dense = found[0].?,
+        .fast_float = found[1].?,
+        .spirv_headers = found[2].?,
+        .cmark = found[3].?,
+        .miniz = found[4].?,
+        .lz4 = found[5].?,
+        .lua = found[6].?,
+        .glslang = found[7].?,
+        .spirv_tools = found[8].?,
     };
 }
 
@@ -320,10 +356,11 @@ fn externalRoot(b: *std.Build, dep_name: []const u8, local_dir: []const u8) ?std
 /// missing sources (for example `external/spirv-tools/source`), so an empty
 /// directory must fall through to the Zig dependency instead.
 fn isPopulatedDir(b: *std.Build, rel: []const u8) bool {
-    var d = std.fs.cwd().openDir(b.pathFromRoot(rel), .{ .iterate = true }) catch return false;
-    defer d.close();
+    const io = b.graph.io;
+    var d = b.root.openDir(io, rel, .{ .iterate = true }) catch return false;
+    defer d.close(io);
     var it = d.iterate();
-    return (it.next() catch return false) != null;
+    return (it.next(io) catch return false) != null;
 }
 
 /// Directory that satisfies `#include "lua/onelua.c"` in the slang-fiddle host
@@ -451,9 +488,9 @@ fn runGenerators(
         const run = b.addRunArtifact(embed_exe);
         run.addFileArg(b.path(b.fmt("prelude/{s}", .{name})));
         const out = run.addOutputFileArg(b.fmt("{s}.cpp", .{name}));
-        run.addArg(b.fmt("-I{s}", .{b.pathFromRoot("source")}));
-        run.addArg(b.fmt("-I{s}", .{b.pathFromRoot("include")}));
-        run.addArg(b.fmt("-I{s}", .{b.pathFromRoot("prelude")}));
+        run.addDirectoryArg2(b.path("source"), .{ .prefix = "-I" });
+        run.addDirectoryArg2(b.path("include"), .{ .prefix = "-I" });
+        run.addDirectoryArg2(b.path("prelude"), .{ .prefix = "-I" });
         prelude_cpps.append(b.allocator, out) catch @panic("out of memory");
         steps.append(b.allocator, &run.step) catch @panic("out of memory");
     }
@@ -473,8 +510,8 @@ fn runGenerators(
 fn addSlang(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    module_optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
+    module_optimize: std.builtin.Optimize,
     external: External,
     core: *std.Build.Step.Compile,
     compiler_core: *std.Build.Step.Compile,
@@ -568,7 +605,7 @@ fn addSlang(
 fn addSlangBootstrap(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     external: External,
     slang_lib: *std.Build.Step.Compile,
     generated: Generated,
@@ -612,7 +649,7 @@ fn addSlangBootstrap(
 fn addHostExecutable(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     external: External,
     lua_include: std.Build.LazyPath,
     name: []const u8,
@@ -653,12 +690,13 @@ fn hostLinkage(target: std.Build.ResolvedTarget) ?std.builtin.LinkMode {
 /// of the provided extensions.
 fn listDirFiles(b: *std.Build, dir: []const u8, exts: []const []const u8) []const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
-    var d = b.build_root.handle.openDir(dir, .{ .iterate = true }) catch |err| {
+    const io = b.graph.io;
+    var d = b.root.openDir(io, dir, .{ .iterate = true }) catch |err| {
         std.debug.panic("unable to open directory '{s}': {s}", .{ dir, @errorName(err) });
     };
-    defer d.close();
+    defer d.close(io);
     var it = d.iterate();
-    while (it.next() catch @panic("directory iteration failed")) |entry| {
+    while (it.next(io) catch @panic("directory iteration failed")) |entry| {
         if (entry.kind != .file) continue;
         for (exts) |ext| {
             if (std.mem.endsWith(u8, entry.name, ext)) {
@@ -696,7 +734,7 @@ const slang_defines_base = [_][]const u8{
 
 /// `_DEBUG` selects the aborting assertion path over `__builtin_assume`,
 /// matching upstream's per-configuration define.
-fn slangDefines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) []const []const u8 {
+fn slangDefines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) []const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     list.appendSlice(b.allocator, &slang_defines_base) catch @panic("out of memory");
     // musl gates the `fpos64_t` / `fgetpos64` aliases (used by
@@ -704,14 +742,14 @@ fn slangDefines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     // `_LARGEFILE64_SOURCE`; glibc exposes them unconditionally.
     if (target.result.abi == .musl)
         list.append(b.allocator, "-D_LARGEFILE64_SOURCE") catch @panic("out of memory");
-    if (optimize == .Debug) list.append(b.allocator, "-D_DEBUG") catch @panic("out of memory");
+    if (optimize == .debug) list.append(b.allocator, "-D_DEBUG") catch @panic("out of memory");
     return list.toOwnedSlice(b.allocator) catch @panic("out of memory");
 }
 
 fn addCore(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     external: External,
     miniz: *std.Build.Step.Compile,
     lz4: *std.Build.Step.Compile,
@@ -741,7 +779,7 @@ fn addCore(
 fn addCompilerCore(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     external: External,
     core: *std.Build.Step.Compile,
     version_header_dir: std.Build.LazyPath,
@@ -783,7 +821,7 @@ fn addCompilerCore(
 fn addMiniz(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     miniz_root: std.Build.LazyPath,
     export_dir: std.Build.LazyPath,
 ) *std.Build.Step.Compile {
@@ -809,7 +847,7 @@ fn addMiniz(
 fn addLz4(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     lz4_root: std.Build.LazyPath,
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{
@@ -835,7 +873,7 @@ fn addLz4(
 fn addCmark(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     cmark_root: std.Build.LazyPath,
     config_dir: std.Build.LazyPath,
 ) *std.Build.Step.Compile {
@@ -892,13 +930,14 @@ fn addCmark(
 fn globSources(b: *std.Build, dir: []const u8, target: std.Build.ResolvedTarget) []const []const u8 {
     const os = target.result.os.tag;
     var list: std.ArrayList([]const u8) = .empty;
-    var d = b.build_root.handle.openDir(dir, .{ .iterate = true }) catch |err| {
+    const io = b.graph.io;
+    var d = b.root.openDir(io, dir, .{ .iterate = true }) catch |err| {
         std.debug.panic("unable to open source directory '{s}': {s}", .{ dir, @errorName(err) });
     };
-    defer d.close();
+    defer d.close(io);
     var walker = d.walk(b.allocator) catch @panic("out of memory");
     defer walker.deinit();
-    while (walker.next() catch @panic("source walk failed")) |entry| {
+    while (walker.next(io) catch @panic("source walk failed")) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".cpp")) continue;
         if (sourceExcluded(entry.path, os)) continue;
@@ -925,8 +964,30 @@ fn sourceExcluded(path: []const u8, os: std.Target.Os.Tag) bool {
 
 fn isUnix(os: std.Target.Os.Tag) bool {
     return switch (os) {
-        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .solaris, .illumos, .haiku, .serenity, .ios, .tvos, .watchos, .visionos, .driverkit => true,
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos, .haiku, .serenity, .ios, .tvos, .watchos, .visionos, .driverkit => true,
         else => false,
+    };
+}
+
+/// Opens a directory named by a `LazyPath` during the configure phase.
+///
+/// Only paths that already exist at configure time (source paths and dependency
+/// paths) can be opened; generated paths only exist during the make phase.
+fn openLazyDir(
+    b: *std.Build,
+    lazy_path: std.Build.LazyPath,
+    options: std.Io.Dir.OpenOptions,
+) std.Io.Dir.OpenError!std.Io.Dir {
+    const io = b.graph.io;
+    return switch (lazy_path) {
+        .src_path => |sp| sp.owner.root.openDir(io, sp.sub_path, options),
+        .dependency => |dep| dep.dependency.builder.root.openDir(io, dep.sub_path, options),
+        .cwd_relative => |sub_path| std.Io.Dir.cwd().openDir(io, sub_path, options),
+        .relative => |r| switch (r.base) {
+            .cwd => std.Io.Dir.cwd().openDir(io, r.sub_path, options),
+            else => @panic("cannot open an install-relative path at configure time"),
+        },
+        .generated => @panic("cannot open a generated path at configure time"),
     };
 }
 
@@ -936,14 +997,14 @@ fn isUnix(os: std.Target.Os.Tag) bool {
 /// Zig dependency (which lives outside the build root).
 fn globCpp(b: *std.Build, root: std.Build.LazyPath, excludes: []const []const u8) []std.Build.LazyPath {
     var list: std.ArrayList(std.Build.LazyPath) = .empty;
-    const abs = root.getPath(b);
-    var d = std.fs.cwd().openDir(abs, .{ .iterate = true }) catch |err| {
-        std.debug.panic("unable to open source directory '{s}': {s}", .{ abs, @errorName(err) });
+    const io = b.graph.io;
+    var d = openLazyDir(b, root, .{ .iterate = true }) catch |err| {
+        std.debug.panic("unable to open source directory '{f}': {s}", .{ root, @errorName(err) });
     };
-    defer d.close();
+    defer d.close(io);
     var walker = d.walk(b.allocator) catch @panic("out of memory");
     defer walker.deinit();
-    while (walker.next() catch @panic("source walk failed")) |entry| {
+    while (walker.next(io) catch @panic("source walk failed")) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".cpp")) continue;
         var excluded = false;
@@ -970,7 +1031,7 @@ fn globCpp(b: *std.Build, root: std.Build.LazyPath, excludes: []const []const u8
 fn addSpirvTools(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     spirv_tools_root: std.Build.LazyPath,
     generated_root: std.Build.LazyPath,
     spirv_headers_root: std.Build.LazyPath,
@@ -1002,7 +1063,7 @@ fn addSpirvTools(
 fn addGlslang(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     glslang_root: std.Build.LazyPath,
     glslang_generated_root: std.Build.LazyPath,
     spirv_tools_root: std.Build.LazyPath,
@@ -1044,7 +1105,7 @@ fn addGlslang(
 fn addSlangGlslang(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     glslang: *std.Build.Step.Compile,
     spirv_tools: *std.Build.Step.Compile,
     external: External,

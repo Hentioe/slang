@@ -14,7 +14,7 @@ Zig 项目直接依赖的构建过程与编译产物。
 `@cImport`/`extern` 接入使用。**本依赖不提供任何 Zig 层 API。**
 
 > [!WARNING]
-> **注意**：本项目是为了给 [Hentioe/jve](https://github.com/Hentioe/jve) 做支持而诞生，除此之外的其它目的都不会作为首要目标。
+> **注意**：本项目主要是给 [Hentioe/jve](https://github.com/Hentioe/jve) 提供支持，除此之外的作用都不会成为首要目的。
 
 ## 外部集成
 
@@ -24,22 +24,10 @@ Zig 项目直接依赖的构建过程与编译产物。
 
 下面是完整的集成步骤。把本项目作为普通 Zig 依赖引入即可，无需把 Slang 源码复制进项目。
 
-### 1. 在 `build.zig.zon` 中声明依赖
+### 1. 在 `build.zig.zon` 添加依赖
 
-```zig
-.{
-    .name = .my_project,
-    .version = "0.0.0",
-    .fingerprint = 0x0, // 运行一次后按提示填写
-    .minimum_zig_version = "0.15.2",
-    .dependencies = .{
-        // 本地路径（相对路径，不能用绝对路径）
-        .slang = .{ .path = "../slang" },
-        // 或使用 git/URL 依赖
-        // .slang = .{ .url = "https://.../slang/archive/<rev>.tar.gz", .hash = "..." },
-    },
-    .paths = .{ "build.zig", "build.zig.zon", "src" },
-}
+```sh
+zig fetch --save git+https://github.com/Hentioe/slang
 ```
 
 ### 2. 在 `build.zig` 中接入
